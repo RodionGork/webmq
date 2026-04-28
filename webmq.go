@@ -51,7 +51,9 @@ func (s *mqWebServer) ListenAndServe(port string) {
 			req, err := s.reqParse(conn)
 			if err == nil {
 				h := int(maphash.String(s.hashSeed, req.path) & 0xFFFFFFFF)
-				s.workers[h%len(s.workers)].ch <- req
+				workerIndex := h % len(s.workers)
+				dbg("req", req.method, req.path, "to worker #", workerIndex)
+				s.workers[workerIndex].ch <- req
 			} else {
 				println("error on parsing request:", err.Error())
 				conn.Close()
@@ -63,12 +65,18 @@ func (s *mqWebServer) ListenAndServe(port string) {
 }
 
 func (w *worker) work() {
+	lastEvictTs := time.Now().UnixMilli()
 	for {
 		select {
 		case req := <-w.ch:
 			w.process(req)
 		default:
 			time.Sleep(30 * time.Millisecond)
+		}
+		ts := time.Now().UnixMilli()
+		if lastEvictTs+300 < ts {
+			w.evict(ts)
+			lastEvictTs = ts
 		}
 	}
 }
@@ -80,10 +88,18 @@ func (w *worker) process(req *request) {
 			respWrite(req.conn, http.StatusBadRequest, "")
 			return
 		}
-		q, ok := w.topics[req.path]
-		if !ok {
-			w.topics[req.path] = []string{req.msg}
+		cli := w.waiting[req.path]
+		if cli != nil {
+			if len(cli) > 0 {
+				dbg("waiter found on", req.path)
+				w.waiting[req.path] = cli[1:]
+				respWrite(cli[0].conn, http.StatusOK, req.msg+"\n")
+				respWrite(req.conn, http.StatusOK, "")
+				return
+			}
+			delete(w.waiting, req.path)
 		}
+		q := w.topics[req.path]
 		w.topics[req.path] = append(q, req.msg)
 		respWrite(req.conn, http.StatusOK, "")
 	case "GET":
@@ -96,9 +112,22 @@ func (w *worker) process(req *request) {
 			}
 			delete(w.topics, req.path)
 		}
-		respWrite(req.conn, http.StatusNotFound, "")
+		cli := w.waiting[req.path]
+		w.waiting[req.path] = append(cli, req)
+		dbg("waiting on", req.path)
 	default:
 		respWrite(req.conn, http.StatusMethodNotAllowed, "")
+	}
+}
+
+func (w *worker) evict(ts int64) {
+	for topic, clients := range w.waiting {
+		offs := 0
+		for offs < len(clients) && clients[offs].deadline < ts {
+			respWrite(clients[offs].conn, http.StatusNotFound, "")
+			offs++
+		}
+		w.waiting[topic] = clients[offs:]
 	}
 }
 
@@ -163,6 +192,12 @@ func newMqWebServer() *mqWebServer {
 		readBuf:  make([]byte, readBufMax),
 		hashSeed: maphash.MakeSeed(),
 		workers:  workers,
+	}
+}
+
+func dbg(args ...any) {
+	if os.Getenv("DBG_EN") != "" {
+		fmt.Println(args...)
 	}
 }
 
