@@ -2,6 +2,12 @@
 
 package main
 
+// this implementation doesn't use web-server from net/http but instead
+// I implemented crude http-request parsing myself, this allows to avoid
+// creating separate goroutines for multiple clients waiting on the same topic
+// (as they anyway need to be processed in FIFO order)
+// instead we parallelize work using specified amount of parallel workers, it's fast :)
+
 import (
 	"bytes"
 	"errors"
@@ -15,7 +21,6 @@ import (
 	"time"
 )
 
-const defaultTimeout = 7
 const readBufMax = 2048 // based upon popular limit on URL length (2000 chars)
 var noNewlineError = errors.New("No newline found when parsing http request")
 
@@ -27,8 +32,8 @@ type mqWebServer struct {
 
 type worker struct {
 	ch      chan *request
-	topics  map[string][]string
-	waiting map[string][]*request
+	topics  map[string]*queue[string]
+	waiting map[string]*queue[*request]
 }
 
 type request struct {
@@ -37,6 +42,32 @@ type request struct {
 	path     string
 	msg      string
 	deadline int64
+}
+
+type queue[E any] struct {
+	body []E
+	base int
+}
+
+func newQueue[E any]() *queue[E] {
+	return &queue[E]{body: make([]E, 0, 8), base: 0}
+}
+
+func (q *queue[E]) add(elem E) {
+	q.body = append(q.body, elem)
+}
+
+func (q *queue[E]) pop() E {
+	res := q.body[0]
+	q.body = q.body[1:]
+	q.base++
+	if q.base > len(q.body) {
+		old := q.body
+		q.body = make([]E, len(old))
+		copy(q.body, old)
+		q.base = 0
+	}
+	return res
 }
 
 func (s *mqWebServer) ListenAndServe(port string) {
@@ -88,33 +119,45 @@ func (w *worker) process(req *request) {
 			respWrite(req.conn, http.StatusBadRequest, "")
 			return
 		}
-		cli := w.waiting[req.path]
-		if cli != nil {
-			if len(cli) > 0 {
-				dbg("waiter found on", req.path)
-				w.waiting[req.path] = cli[1:]
-				respWrite(cli[0].conn, http.StatusOK, req.msg+"\n")
-				respWrite(req.conn, http.StatusOK, "")
-				return
+		waitQueue := w.waiting[req.path]
+		if waitQueue != nil {
+			dbg("waiter found on", req.path)
+			client := waitQueue.pop()
+			if len(waitQueue.body) == 0 {
+				delete(w.waiting, req.path)
 			}
-			delete(w.waiting, req.path)
+			respWrite(client.conn, http.StatusOK, req.msg+"\n")
+			respWrite(req.conn, http.StatusOK, "")
+			return
 		}
-		q := w.topics[req.path]
-		w.topics[req.path] = append(q, req.msg)
+		msgQueue := w.topics[req.path]
+		if msgQueue == nil {
+			msgQueue = newQueue[string]()
+			w.topics[req.path] = msgQueue
+		}
+		msgQueue.add(req.msg)
 		respWrite(req.conn, http.StatusOK, "")
 	case "GET":
-		q := w.topics[req.path]
-		if q != nil {
-			if len(q) > 0 {
-				w.topics[req.path] = q[1:]
-				respWrite(req.conn, http.StatusOK, q[0]+"\n")
-				return
+		msgQueue := w.topics[req.path]
+		if msgQueue != nil {
+			msg := msgQueue.pop()
+			if len(msgQueue.body) == 0 {
+				delete(w.topics, req.path)
 			}
-			delete(w.topics, req.path)
+			respWrite(req.conn, http.StatusOK, msg+"\n")
+			return
 		}
-		cli := w.waiting[req.path]
-		w.waiting[req.path] = append(cli, req)
-		dbg("waiting on", req.path)
+		if req.deadline > 0 {
+			waitQueue := w.waiting[req.path]
+			if waitQueue == nil {
+				waitQueue = newQueue[*request]()
+				w.waiting[req.path] = waitQueue
+			}
+			waitQueue.add(req)
+			dbg("waiting on", req.path)
+		} else {
+			respWrite(req.conn, http.StatusNotFound, "")
+		}
 	default:
 		respWrite(req.conn, http.StatusMethodNotAllowed, "")
 	}
@@ -122,12 +165,12 @@ func (w *worker) process(req *request) {
 
 func (w *worker) evict(ts int64) {
 	for topic, clients := range w.waiting {
-		offs := 0
-		for offs < len(clients) && clients[offs].deadline < ts {
-			respWrite(clients[offs].conn, http.StatusNotFound, "")
-			offs++
+		for len(clients.body) > 0 && clients.body[0].deadline < ts {
+			respWrite(clients.pop().conn, http.StatusNotFound, "")
 		}
-		w.waiting[topic] = clients[offs:]
+		if len(clients.body) == 0 {
+			delete(w.waiting, topic)
+		}
 	}
 }
 
@@ -150,16 +193,15 @@ func (s *mqWebServer) reqParse(conn net.Conn) (*request, error) {
 	if err != nil {
 		return nil, err
 	}
-	to, err := strconv.Atoi(u.Query().Get("timeout"))
-	if err != nil {
-		to = defaultTimeout
-	}
 	req := &request{
 		conn:     conn,
 		method:   method,
 		path:     u.Path,
 		msg:      u.Query().Get("v"),
-		deadline: time.Now().UnixMilli() + int64(to)*1000,
+		deadline: 0,
+	}
+	if to, err := strconv.Atoi(u.Query().Get("timeout")); err == nil {
+		req.deadline = time.Now().UnixMilli() + int64(to)*1000
 	}
 	return req, nil
 }
@@ -183,8 +225,8 @@ func newMqWebServer() *mqWebServer {
 	for i := 0; i < numWorkers; i++ {
 		workers[i] = &worker{
 			ch:      make(chan *request),
-			topics:  map[string][]string{},
-			waiting: map[string][]*request{},
+			topics:  map[string]*queue[string]{},
+			waiting: map[string]*queue[*request]{},
 		}
 		go workers[i].work()
 	}
